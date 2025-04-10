@@ -1,0 +1,242 @@
+# DRUG-seq Data Analysis Pipeline
+# Author: Muralidharan Mani
+# Affiliation:University of Wisconsin-Madison
+# This script provides an end-to-end analysis workflow for DRUG-seq data using Seurat and DESeq2
+
+# -------------------------------------------------------------
+# Setup & Install Required Packages
+# -------------------------------------------------------------
+
+# Check and install Bioconductor and required packages
+if (!requireNamespace("BiocManager", quietly = TRUE)) {
+    install.packages("BiocManager")
+}
+
+# List of required Bioconductor packages
+pkgs_bioc <- c("Seurat", "DESeq2", "edgeR", "limma", "clusterProfiler", "org.Hs.eg.db", "NicheNetR")
+
+# Install any missing Bioconductor packages
+for (pkg in pkgs_bioc) {
+    if (!requireNamespace(pkg, quietly = TRUE)) {
+        tryCatch({
+            BiocManager::install(pkg)
+        }, error = function(e) {
+            message(paste("Failed to install package:", pkg, "|", e))
+        })
+    }
+}
+
+# List of required CRAN packages
+pkgs_cran <- c("tidyverse", "ggplot2", "pheatmap", "viridis", "EnhancedVolcano")
+
+# Install any missing CRAN packages
+for (pkg in pkgs_cran) {
+    if (!requireNamespace(pkg, quietly = TRUE)) {
+        tryCatch({
+            install.packages(pkg)
+        }, error = function(e) {
+            message(paste("Failed to install package:", pkg, "|", e))
+        })
+    }
+}
+
+# Load Libraries
+library(Seurat)
+library(DESeq2)
+library(edgeR)
+library(limma)
+library(clusterProfiler)
+library(org.Hs.eg.db)
+library(ggplot2)
+library(pheatmap)
+library(dplyr)
+library(viridis)
+library(EnhancedVolcano)
+library(NicheNetR)
+
+# -------------------------------------------------------------
+# Load & Preprocess DRUG-seq Data
+# -------------------------------------------------------------
+
+# Define data directory - **IMPORTANT: UPDATE THIS PATH TO YOUR DATA DIRECTORY**
+data_dir <- "path/to/counts_matrix/"
+if (data_dir == "path/to/counts_matrix/") {
+    warning("Please update the 'data_dir' variable with the correct path to your counts matrix.")
+}
+
+# Load single-cell RNA-seq data
+counts <- Read10X(data.dir = data_dir)
+
+# Create Seurat object
+drug_seurat <- CreateSeuratObject(counts = counts, project = "DRUGseq")
+
+# Metadata creation options
+# Option 1: Infer condition from column names (simple case)
+drug_seurat$condition <- factor(ifelse(grepl("drug", colnames(drug_seurat), ignore.case = TRUE), "Drug", "Control"))
+
+# Option 2: Load from a separate metadata file (recommended for complex experiments)
+# metadata <- read.csv("path/to/metadata.csv") # Update this path
+# Ensure your metadata has a column that can be merged with the Seurat object's cell names
+# drug_seurat <- AddMetaData(drug_seurat, metadata, by.x = "orig.ident", by.y = "cell_id_column_in_metadata")
+# drug_seurat$condition <- factor(drug_seurat$condition) # Ensure it's a factor
+
+# -----------------------------------------------------------------
+# Quality Control (QC)
+# -----------------------------------------------------------------
+
+# Calculate QC metrics
+drug_seurat[["percent.mt"]] <- PercentageFeatureSet(drug_seurat, pattern = "^MT-")
+drug_seurat[["log10GenesPerUMI"]] <- log10(drug_seurat$nFeature_RNA) / log10(drug_seurat$nCount_RNA)
+
+# Visualize QC metrics
+VlnPlot(drug_seurat, features = c("nFeature_RNA", "nCount_RNA", "percent.mt"), ncol = 3)
+plot1 <- FeatureScatter(drug_seurat, feature1 = "nCount_RNA", feature2 = "percent.mt")
+plot2 <- FeatureScatter(drug_seurat, feature1 = "nCount_RNA", feature2 = "nFeature_RNA")
+print(plot1 + plot2)
+
+# Filter cells based on QC metrics
+drug_seurat <- subset(drug_seurat,
+                      subset = nFeature_RNA > 200 &
+                               nFeature_RNA < 6000 &
+                               percent.mt < 20)
+
+# Visualize QC after filtering
+VlnPlot(drug_seurat, features = c("nFeature_RNA", "nCount_RNA", "percent.mt"), ncol = 3)
+
+# Normalize data using SCTransform (alternative to NormalizeData)
+drug_seurat <- SCTransform(drug_seurat, vars.to.regress = "percent.mt")
+
+# -------------------------------------------------------------
+# Differential Gene Expression (DEG) Analysis
+# -------------------------------------------------------------
+
+# Prepare data for DESeq2 analysis (if desired)
+colData <- data.frame(condition = drug_seurat$condition)
+rownames(colData) <- colnames(drug_seurat)
+dds <- DESeqDataSetFromMatrix(countData = as.matrix(drug_seurat@assays$RNA@counts),
+                             colData = colData,
+                             design = ~ condition # Consider adjusting this for more complex designs
+)
+
+# Run DESeq2
+dds <- DESeq(dds)
+res <- results(dds, contrast = c("condition", "Drug", "Control"))
+sig_genes_deseq <- res %>%
+    as.data.frame() %>%
+    filter(padj < 0.05 & abs(log2FoldChange) > 0.5)
+cat(paste("Number of significant DEGs (DESeq2):", nrow(sig_genes_deseq), "\n"))
+
+# -------------------------------------------------------------
+# Pathway and Functional Enrichment
+# -------------------------------------------------------------
+
+# Convert gene symbols to Entrez IDs
+entrez_ids <- na.omit(mapIds(org.Hs.eg.db,
+                             keys = rownames(sig_genes_deseq),
+                             keytype = "SYMBOL",
+                             column = "ENTREZID"))
+cat(paste("Number of significant DEGs with Entrez IDs:", length(entrez_ids), "\n"))
+
+# Run GO enrichment (Biological Process)
+go_enrich_bp <- enrichGO(gene = entrez_ids,
+                          OrgDb = org.Hs.eg.db,
+                          ont = "BP",
+                          pvalueCutoff = 0.05)
+if (!is.null(go_enrich_bp)) {
+    print("GO Enrichment (BP) Results:")
+    print(head(go_enrich_bp))
+    dotplot(go_enrich_bp, showCategory = 15, title = "GO Enrichment (Biological Process)")
+} else {
+    print("No significant GO terms found (Biological Process).")
+}
+
+# Run KEGG pathway enrichment
+kegg_enrich <- enricher(gene = entrez_ids,
+                         TERM2GENE = KEGG.db::KEGGPATHID2EXTID,
+                         TERM2NAME = KEGG.db::KEGGPATHID2NAME,
+                         pvalueCutoff = 0.05)
+if (!is.null(kegg_enrich)) {
+    dotplot(kegg_enrich, showCategory = 15, title = "KEGG Pathway Enrichment")
+} else {
+    print("No significant KEGG pathways found.")
+}
+
+# -------------------------------------------------------------
+# Drug Response Prediction (Optional)
+# -------------------------------------------------------------
+
+# Check if NicheNetR is available
+if (!requireNamespace("NicheNetR", quietly = TRUE)) {
+    BiocManager::install("NicheNetR")
+}
+
+if (requireNamespace("NicheNetR", quietly = TRUE)) {
+    library(NicheNetR)
+    
+    # Brief explanation: NicheNetR predicts ligand-receptor interactions and their downstream target genes,
+    # potentially influenced by the drug treatment.
+
+    # Predict ligand-receptor interactions
+    ligand_target_matrix <- construct_ligand_target_matrix(species = "human")
+    lr_network <- construct_ligand_receptor_network(species = "human")
+    
+    weighted_networks <- construct_weighted_networks(lr_network, ligand_target_matrix, sig_genes = rownames(sig_genes_deseq))
+
+    expressed_genes <- rownames(drug_seurat)
+    receptors <- unique(lr_network$receptor)
+    expressed_receptors <- intersect(receptors, expressed_genes)
+
+    ligand_activities <- predict_ligand_activities(geneset = rownames(sig_genes_deseq),
+                                                   background_genes = expressed_genes,
+                                                   ligand_target_matrix = ligand_target_matrix,
+                                                   potential_ligands = unique(lr_network$ligand))
+
+    top_ligands <- ligand_activities %>% arrange(-scaled_ligand_activity) %>% head()
+    print("Top predicted ligands based on DEGs:")
+    print(top_ligands)
+} else {
+    print("NicheNetR not installed, skipping drug response prediction.")
+}
+
+# -------------------------------------------------------------
+# Visualization
+# -------------------------------------------------------------
+
+# Volcano Plot for DEGs
+volcano_plot <- EnhancedVolcano(sig_genes_deseq,
+                                lab = rownames(sig_genes_deseq),
+                                x = 'log2FoldChange',
+                                y = 'padj',
+                                pCutoff = 0.05,
+                                FCcutoff = 0.5,
+                                title = "Differential Gene Expression",
+                                subtitle = "Drug vs. Control",
+                                caption = "Cutoffs: log2FC > 0.5, adj. p-val < 0.05")
+print(volcano_plot)
+ggsave("volcano_plot_seurat.png", volcano_plot, width = 8, height = 6)
+
+# Heatmap of Top DEGs
+if (nrow(sig_genes_deseq) > 0) {
+    num_top_genes <- min(50, nrow(sig_genes_deseq))
+    top_genes <- rownames(sig_genes_deseq)[1:num_top_genes]
+    heatmap_plot <- DoHeatmap(drug_seurat, features = top_genes, group.by = "condition") +
+        ggtitle(paste("Top", num_top_genes, "Significant DEGs")) +
+        theme(axis.text.y = element_text(size = 6))
+    print(heatmap_plot)
+    ggsave("heatmap_top_degs_seurat.png", heatmap_plot, width = 10, height = 8)
+} else {
+    print("No significant DEGs to plot in heatmap.")
+}
+
+# Optional: Feature plot on UMAP if dimensionality reduction has been performed
+# Commenting out to avoid errors
+# if ("umap" %in% names(drug_seurat@reductions)) {
+#     feature_plot <- FeaturePlot(drug_seurat, features = head(rownames(sig_genes_deseq), 5), reduction = "umap", ncol = 5)
+#     print(feature_plot)
+#     ggsave("feature_plot_umap_top_degs.png", feature_plot, width = 15, height = 3)
+# }
+
+# -------------------------------------------------------------
+# Session Information
+# -------------------------------------------------------------
+sessionInfo()
